@@ -9,9 +9,11 @@ import SwiftUI
 
 @main
 struct Gift_CompassApp: App {
+    @UIApplicationDelegateAdaptor(GiftCompassAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            CompassLaunchRouter()
         }
     }
 }
