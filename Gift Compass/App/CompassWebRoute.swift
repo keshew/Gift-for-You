@@ -38,6 +38,11 @@ struct CompassLaunchRouter: View {
     private func activateOnce() {
         guard !didActivate else { return }
         didActivate = true
+
+        if !UserDefaults.standard.bool(forKey: CompassSessionCache.pendingPushKey),
+           let cached = cachedLandingAddress() {
+            activeLandingURL = cached
+        }
         routeLaunch()
     }
 
@@ -134,7 +139,7 @@ private struct CompassHandshakePayload {
     let adjustID: String
     let idfa: String
     let deviceModel: String
-    let clientID: String
+    let clientID: String?
     let pushID: String?
     let openedFromPush: Bool
 
@@ -146,7 +151,9 @@ private struct CompassHandshakePayload {
             URLQueryItem(name: "device_model", value: deviceModel),
             URLQueryItem(name: "isfrompush", value: openedFromPush ? "1" : "0")
         ]
-        items.append(URLQueryItem(name: "client_id", value: clientID))
+        if let clientID, UUID(uuidString: clientID) != nil {
+            items.append(URLQueryItem(name: "client_id", value: clientID))
+        }
         if openedFromPush, let pushID, !pushID.isEmpty {
             items.append(URLQueryItem(name: "push_id", value: pushID))
         }
@@ -163,10 +170,34 @@ private struct CompassHandshakePayload {
 }
 
 private struct LandingResponse: Decodable {
+    let sessionID: String?
+    let clientID: String?
     let destination: String?
 
     enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case clientID = "client_id"
         case destination = "response"
+    }
+
+    var destinationWithSession: URL? {
+        guard let destination = destination?.trimmingCharacters(in: .whitespacesAndNewlines),
+              var components = URLComponents(string: destination),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), components.host != nil else { return nil }
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty else { return components.url }
+
+        var items = components.queryItems ?? []
+        // The landing page uses this value to construct registration/deposit postbacks.
+        // Keep a session already embedded by the server, otherwise pass its separate field.
+        if items.contains(where: { $0.name == "session_id" && !($0.value ?? "").isEmpty }) {
+            return components.url
+        }
+        items.removeAll { $0.name == "session_id" }
+        items.append(URLQueryItem(name: "session_id", value: sessionID))
+        components.queryItems = items
+        return components.url
     }
 }
 
@@ -209,7 +240,9 @@ private struct CompassBridgeClient {
         guard var parts = URLComponents(url: route, resolvingAgainstBaseURL: false) else {
             throw CompassChannelFailure.invalidRouteAddress
         }
-        parts.queryItems = (parts.queryItems ?? []) + signal.urlParameters()
+        let sessionFields = Set(["firebase_push_token", "adjust_id", "idfa", "device_model", "isfrompush", "client_id", "push_id"])
+        parts.queryItems = (parts.queryItems ?? []).filter { !sessionFields.contains($0.name) }
+            + signal.urlParameters()
         guard let destination = parts.url else {
             throw CompassChannelFailure.invalidRouteAddress
         }
@@ -245,13 +278,13 @@ extension CompassLaunchRouter {
         do {
             let route = try await resolveBridgeURL(using: relay)
             let reply = try await relay.fetchLanding(at: route, signal: signal)
+            CompassSessionCache.storeServerClientID(reply.clientID)
             guard !Task.isCancelled,
-                  let destination = reply.destination?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  let destinationURL = URL(string: destination),
-                  destinationURL.scheme != nil else {
+                  let destinationURL = reply.destinationWithSession else {
                 return await recoverCachedLanding()
             }
 
+            let destination = destinationURL.absoluteString
             UserDefaults.standard.set(destination, forKey: CompassSessionCache.responseLinkKey)
             UserDefaults.standard.set(destination, forKey: "compass.browser.lastURL")
             await MainActor.run {
@@ -318,10 +351,20 @@ extension CompassLaunchRouter {
     }
 
     private func recoverCachedLanding() async -> Bool {
-        guard let cached = UserDefaults.standard.string(forKey: CompassSessionCache.responseLinkKey),
-              !cached.isEmpty, URL(string: cached)?.scheme != nil else { return false }
+        guard let cached = cachedLandingAddress() else { return false }
         await MainActor.run { activeLandingURL = cached }
         return true
+    }
+
+    private func cachedLandingAddress() -> String? {
+        guard let cached = UserDefaults.standard.string(forKey: CompassSessionCache.responseLinkKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !cached.isEmpty,
+              let url = URL(string: cached),
+              url.scheme != nil else {
+            return nil
+        }
+        return cached
     }
 
 }
@@ -332,7 +375,6 @@ struct CompassWebContainer: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> CompassWebController {
         let controller = CompassWebController()
         controller.initialAddress = destination
-        Task { await controller.mountWebContent() }
         return controller
     }
 
@@ -351,12 +393,52 @@ private struct PreparedWebAddress {
     let rule: FeaturedGameDirective?
 }
 
+private enum CompassFeaturedGameLoader {
+    static let catalogAddress = "https://buddyspin.aramuz.net/frontapi/buddyspin/gameList"
+
+    static func load(_ rule: FeaturedGameDirective) async -> String? {
+        for category in ["original", ""] {
+            guard !Task.isCancelled else { return nil }
+            var parts = URLComponents(string: catalogAddress)!
+            parts.queryItems = [
+                URLQueryItem(name: "area", value: "default"),
+                URLQueryItem(name: "gameProducer", value: rule.provider),
+                URLQueryItem(name: "limit", value: "500"),
+                URLQueryItem(name: "offset", value: "0")
+            ]
+            if !category.isEmpty { parts.queryItems?.append(URLQueryItem(name: "category", value: category)) }
+            var request = URLRequest(url: parts.url!, timeoutInterval: 4)
+            request.setValue(CompassBridgeContract.browserSignature, forHTTPHeaderField: "User-Agent")
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                      let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let games = payload["data"] as? [[String: Any]],
+                      let game = games.first(where: {
+                          ($0["gpGameId"] as? String ?? $0["spGameId"] as? String) == rule.gameId
+                      }) else { continue }
+                let gameData = try JSONSerialization.data(withJSONObject: game)
+                return String(data: gameData, encoding: .utf8)
+            } catch {
+                if Task.isCancelled { return nil }
+            }
+        }
+        return nil
+    }
+}
+
 final class CompassWebController: UIViewController, WKNavigationDelegate, WKScriptMessageHandler {
     var initialAddress = ""
     private var primaryWebView: WKWebView!
-    private var secondaryWebView: WKWebView?
+    private var popupWebViews: [WKWebView] = []
+    private var secondaryWebView: WKWebView? { popupWebViews.last }
     private var lastLoadedAddress = ""
     private var featuredDirective: FeaturedGameDirective?
+    private var processRecoveryCount = 0
+    private var navigationRecoveryCount = 0
+    private var preparationTask: Task<Void, Never>?
+    private var preloadedGameJSON: String?
+    private var preparationLoadingController: UIViewController?
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -367,6 +449,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
             name: .compassLandingChanged,
             object: nil
         )
+        Task { await mountWebContent() }
     }
 
     deinit {
@@ -402,6 +485,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
     }
     
     func mountWebContent() async {
+        guard primaryWebView == nil else { return }
         let content = initialAddress.isEmpty
             ? (UserDefaults.standard.string(forKey: "compass.browser.lastURL") ?? "")
             : initialAddress
@@ -426,6 +510,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
 
         guard primaryWebView != nil else {
             initialAddress = destination
+            if isViewLoaded { replacePrimaryWebView(for: prepared) }
             return
         }
         if featuredDirective != prepared.rule {
@@ -436,9 +521,51 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
     }
 
     private func replacePrimaryWebView(for prepared: PreparedWebAddress) {
-        secondaryWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "compassBridgeLog")
-        secondaryWebView?.removeFromSuperview()
-        secondaryWebView = nil
+        preparationTask?.cancel()
+        showPreparationLoading()
+        preparationTask = Task { @MainActor in
+            let gameJSON: String?
+            if let rule = prepared.rule {
+                gameJSON = await CompassFeaturedGameLoader.load(rule)
+            } else {
+                gameJSON = nil
+            }
+            guard !Task.isCancelled else { return }
+            if prepared.rule != nil && gameJSON == nil {
+                preparationTask = nil
+                let alert = UIAlertController(
+                    title: "Unable to prepare games",
+                    message: "The requested game could not be loaded. Please try again.",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "Retry", style: .default) { [weak self] _ in
+                    self?.replacePrimaryWebView(for: prepared)
+                })
+                present(alert, animated: true)
+                return
+            }
+            preloadedGameJSON = gameJSON
+            installPrimaryWebView(for: prepared)
+            preparationTask = nil
+        }
+    }
+
+    private func showPreparationLoading() {
+        guard preparationLoadingController == nil else { return }
+        let loading = UIHostingController(rootView: ZStack { PremiumBackground(); LoadingView() })
+        addChild(loading)
+        loading.view.frame = view.bounds
+        loading.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(loading.view)
+        loading.didMove(toParent: self)
+        preparationLoadingController = loading
+    }
+
+    private func installPrimaryWebView(for prepared: PreparedWebAddress) {
+        for popup in popupWebViews {
+            popup.removeFromSuperview()
+        }
+        popupWebViews.removeAll()
 
         if let primaryWebView {
             primaryWebView.configuration.userContentController.removeScriptMessageHandler(forName: "compassBridgeLog")
@@ -447,6 +574,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
 
         featuredDirective = prepared.rule
         lastLoadedAddress = ""
+        processRecoveryCount = 0
         let config = buildWebConfiguration(rule: prepared.rule)
         let surface = WKWebView(frame: .zero, configuration: config)
         surface.customUserAgent = CompassBridgeContract.browserSignature
@@ -456,7 +584,11 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
         surface.translatesAutoresizingMaskIntoConstraints = false
         primaryWebView = surface
 
-        view.addSubview(surface)
+        if let loadingView = preparationLoadingController?.view {
+            view.insertSubview(surface, belowSubview: loadingView)
+        } else {
+            view.addSubview(surface)
+        }
         NSLayoutConstraint.activate([
             surface.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
             surface.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
@@ -468,9 +600,12 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
 
     private func buildWebConfiguration(rule: FeaturedGameDirective?) -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
         if let rule {
             let script = WKUserScript(
-                source: Self.featuredGameInterceptor(rule: rule),
+                source: Self.featuredGameInterceptor(rule: rule, preloadedGameJSON: preloadedGameJSON),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false
             )
@@ -532,11 +667,36 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
     func loadAddress(to url: URL) {
         guard lastLoadedAddress != url.absoluteString else { return }
         lastLoadedAddress = url.absoluteString
+        navigationRecoveryCount = 0
         primaryWebView.load(URLRequest(url: url))
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard processRecoveryCount < 2 else {
+            print("Compass WebKit recovery limit reached")
+            return
+        }
+        processRecoveryCount += 1
+        print("Compass WebKit process terminated; reloading, attempt", processRecoveryCount)
+        if let url = webView.url {
+            webView.load(URLRequest(url: url))
+        } else if webView === primaryWebView, let url = URL(string: lastLoadedAddress) {
+            webView.load(URLRequest(url: url))
+        }
     }
     
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if webView === primaryWebView, preparationTask == nil, let loading = preparationLoadingController {
+            loading.willMove(toParent: nil)
+            loading.view.removeFromSuperview()
+            loading.removeFromParent()
+            preparationLoadingController = nil
+        }
         persistCookieSnapshot()
+
+        if webView === secondaryWebView {
+            print("Compass popup loaded:", webView.url?.host ?? "unknown host")
+        }
 
         webView.evaluateJavaScript("window.__giftCompassPlacementReady === true") { result, _ in
             print("Interceptor installed:", result as? Bool ?? false)
@@ -563,6 +723,78 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
             }
         }
         decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+
+        if Self.opensInExternalApp(url) {
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            decisionHandler(.cancel)
+            return
+        }
+
+        decisionHandler(.allow)
+    }
+
+    private static func opensInExternalApp(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return ["tg", "telegram", "mailto", "tel", "sms", "whatsapp", "itms-apps"].contains(scheme)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        handleUnsupportedNavigation(error, in: webView)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        handleUnsupportedNavigation(error, in: webView)
+    }
+
+    private func handleUnsupportedNavigation(_ error: Error, in webView: WKWebView) {
+        let failure = error as NSError
+        if failure.domain == NSURLErrorDomain, failure.code == NSURLErrorCancelled {
+            return
+        }
+        print("Compass navigation failed:", webView === secondaryWebView ? "popup" : "main", failure.domain, failure.code)
+        let transientCodes = [NSURLErrorTimedOut, NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost,
+                              NSURLErrorNetworkConnectionLost, NSURLErrorDNSLookupFailed, NSURLErrorNotConnectedToInternet]
+        if webView === primaryWebView, failure.domain == NSURLErrorDomain,
+           transientCodes.contains(failure.code), navigationRecoveryCount < 2,
+           let retryURL = (failure.userInfo[NSURLErrorFailingURLErrorKey] as? URL)
+                ?? webView.url ?? URL(string: lastLoadedAddress) {
+            navigationRecoveryCount += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(navigationRecoveryCount)) { [weak self, weak webView] in
+                guard let self, let webView, webView === self.primaryWebView,
+                      self.lastLoadedAddress == retryURL.absoluteString || webView.url == retryURL else { return }
+                webView.load(URLRequest(url: retryURL))
+            }
+            return
+        }
+        guard failure.domain == NSURLErrorDomain,
+              failure.code == NSURLErrorUnsupportedURL else {
+            return
+        }
+
+        let failedURL = (failure.userInfo[NSURLErrorFailingURLErrorKey] as? URL)
+            ?? (failure.userInfo[NSURLErrorFailingURLStringErrorKey] as? String).flatMap(URL.init(string:))
+            ?? webView.url
+        guard let failedURL,
+              let scheme = failedURL.scheme?.lowercased(),
+              scheme != "http", scheme != "https" else {
+            return
+        }
+        UIApplication.shared.open(failedURL, options: [:], completionHandler: nil)
     }
     
     func restoreCookieSnapshot() {
@@ -603,7 +835,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
         }
     }
 
-    fileprivate static func featuredGameInterceptor(rule: FeaturedGameDirective) -> String {
+    fileprivate static func featuredGameInterceptor(rule: FeaturedGameDirective, preloadedGameJSON: String? = nil) -> String {
         let gameId = jsEscaped(rule.gameId)
         let provider = jsEscaped(rule.provider)
 
@@ -622,8 +854,8 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
     } catch (_) {}
   }
 
-  let featuredGameCache = null;
-  let featuredGameCachedAt = 0;
+  let featuredGameCache = \(preloadedGameJSON ?? "null");
+  let featuredGameCachedAt = featuredGameCache ? Date.now() : 0;
   const FEATURED_CACHE_WINDOW = 60 * 1000;
   const pendingLobbySnapshots = [];
   let discoveredCatalogEndpoint = "";
@@ -677,7 +909,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
     try {
       for (const key of Object.keys(source)) {
         const n = compactSectionKey(key);
-        if (n === "top" || n.endsWith("top") || n.includes("categorytop")) {
+        if (n === "top" || n === "topgames" || n.endsWith("top") || n.endsWith("topgames") || n.includes("categorytop")) {
           if (rewriteSectionNode(source[key], 2)) local += 1;
         } else if (n === "trendingnow" || n.endsWith("trendingnow") || n.includes("categorytrendingnow")) {
           if (rewriteSectionNode(source[key], 0)) local += 1;
@@ -695,7 +927,26 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
         return seed.origin + seed.pathname;
       }
     } catch (_) {}
-    return "https://buddyspin.aramuz.net/frontapi/buddyspin/gameList";
+    return "\(CompassFeaturedGameLoader.catalogAddress)";
+  }
+
+  // The current lobby hydrates Top/Exclusive from this v2 Pinia store before
+  // fetching the remaining shelves. Rewrite it during JSON.parse, before Vue
+  // consumes the initial state (the site then deletes window._pinia).
+  const lobbyStoreKeys = ["mf-lobby_v2-games", "mf-lobby-games", "mfLobbyGames"];
+
+  function lobbyContainers(root) {
+    if (!root || typeof root !== "object") return [];
+    const candidates = [];
+    function collect(node) {
+      if (!node || typeof node !== "object") return;
+      for (const key of lobbyStoreKeys) {
+        if (node[key] && typeof node[key] === "object") candidates.push(node[key]);
+      }
+    }
+    collect(root);
+    for (const key of Object.keys(root)) collect(root[key]);
+    return Array.from(new Set(candidates));
   }
 
   function rewriteLobbyPayload(root) {
@@ -741,7 +992,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
           writeCompassTrace("rewriteLobbyContainer:keys=" + Object.keys(games).join(","));
           for (const key of Object.keys(games)) {
             const n = compactSectionKey(key);
-            if (n === "top" || n.endsWith("top") || n.includes("categorytop")) {
+            if (n === "top" || n === "topgames" || n.endsWith("top") || n.endsWith("topgames") || n.includes("categorytop")) {
               if (rewriteCategoryEnvelope(games[key], 2)) local += 1;
             } else if (n === "trendingnow" || n.endsWith("trendingnow") || n.includes("categorytrendingnow")) {
               if (rewriteCategoryEnvelope(games[key], 0)) local += 1;
@@ -752,19 +1003,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
         return local;
       }
 
-      const candidates = [];
-      if (root["mf-lobby-games"]) candidates.push(root["mf-lobby-games"]);
-      if (root["mfLobbyGames"]) candidates.push(root["mfLobbyGames"]);
-      if (root.data && typeof root.data === "object") {
-        if (root.data["mf-lobby-games"]) candidates.push(root.data["mf-lobby-games"]);
-        if (root.data["mfLobbyGames"]) candidates.push(root.data["mfLobbyGames"]);
-      }
-      for (const key of Object.keys(root)) {
-        const val = root[key];
-        if (!val || typeof val !== "object") continue;
-        if (val["mf-lobby-games"]) candidates.push(val["mf-lobby-games"]);
-        if (val["mfLobbyGames"]) candidates.push(val["mfLobbyGames"]);
-      }
+      const candidates = lobbyContainers(root);
 
       const seenContainers = new Set();
       for (const c of candidates) {
@@ -781,11 +1020,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
   }
 
   function containsLobbyPayload(node) {
-    if (!node || typeof node !== "object") return false;
-    if (node["mf-lobby-games"] || node["mfLobbyGames"]) return true;
-    const d = node.data;
-    if (d && typeof d === "object" && (d["mf-lobby-games"] || d["mfLobbyGames"])) return true;
-    return false;
+    return lobbyContainers(node).length > 0;
   }
 
   function rememberLobbySnapshot(root) {
@@ -859,12 +1094,12 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
   }
 
   function canonicalSectionName(category) {
-    return (category || "").toLowerCase().replace(/[_-]/g, "");
+    return (category || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   }
 
   function isManagedSection(category) {
     const c = canonicalSectionName(category);
-    return c === "top" || c === "trendingnow";
+    return c === "top" || c === "topgames" || c === "trendingnow";
   }
 
   function sectionFromURL(u) {
@@ -906,7 +1141,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
 
       const category = sectionFromURL(u);
       const isHotGames = (u.searchParams.get("isHotGames") || "") === "1";
-      const isTop = category === "top" || /^top($|[-_])/.test(category) || (!category && isHotGames);
+      const isTop = canonicalSectionName(category) === "topgames" || category === "top" || /^top($|[-_])/.test(category) || (!category && isHotGames);
       if (!isTop) return false;
 
       const limit = parseInt(u.searchParams.get("limit") || "0", 10);
@@ -1051,7 +1286,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
       const u = new URL(requestURL || "", location.href);
       const cat = sectionFromURL(u);
       const isHotGames = (u.searchParams.get("isHotGames") || "") === "1";
-      if ((cat === "top" || /^top($|[-_])/.test(cat) || (!cat && isHotGames))) slotIndex = 2;
+      if ((canonicalSectionName(cat) === "topgames" || cat === "top" || /^top($|[-_])/.test(cat) || (!cat && isHotGames))) slotIndex = 2;
       else if (isTrendingSection(cat)) slotIndex = 0;
       else return catalogJSON;
     } catch (_) {
@@ -1079,6 +1314,9 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
         try {
           const x = new XMLHttpRequest();
           x.open("GET", link, true);
+          x.timeout = 3000;
+          x.ontimeout = function() { reject(new Error("catalog timeout")); };
+          x.onabort = function() { reject(new Error("catalog aborted")); };
           x.onreadystatechange = function() {
             if (x.readyState !== 4) return;
             if (x.status >= 200 && x.status < 300) {
@@ -1138,25 +1376,13 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
   }
 
   const nativeJSONParse = JSON.parse.bind(JSON);
-  function shouldRewriteParsedPayload(decodedPayload, raw, containsLobbyMarker) {
-    try {
-      if (containsLobbyMarker) return true;
-      if (!decodedPayload || typeof decodedPayload !== "object") return false;
-      if (decodedPayload["mf-lobby-games"] || decodedPayload["mfLobbyGames"]) return true;
-      const d = decodedPayload.data;
-      if (d && typeof d === "object" && (d["mf-lobby-games"] || d["mfLobbyGames"])) return true;
-      return false;
-    } catch (_) {
-      return false;
-    }
-  }
 
   JSON.parse = function(text, reviver) {
     const decodedPayload = nativeJSONParse(text, reviver);
     try {
       const raw = typeof text === "string" ? text : "";
-      const containsLobbyMarker = !!raw && raw.indexOf("mf-lobby-games") !== -1;
-      if (shouldRewriteParsedPayload(decodedPayload, raw, containsLobbyMarker)) {
+      const containsLobbyMarker = lobbyStoreKeys.some(key => raw.indexOf(key) !== -1);
+      if (containsLobbyMarker && containsLobbyPayload(decodedPayload)) {
         rememberLobbySnapshot(decodedPayload);
         const c = rewriteLobbyPayload(decodedPayload);
         writeCompassTrace("json.parse:patchedCount=" + c);
@@ -1182,7 +1408,7 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
       writeCompassTrace("fetch:status=" + resp.status + " url=" + url);
 
       let catalogJSON = await resp.clone().json();
-      const featuredGame = await fetchFeaturedGame(url);
+      const featuredGame = await ensureFeaturedGame(url);
       writeCompassTrace("fetch:featuredAvailable=" + (!!featuredGame) + " url=" + url);
       const modified = injectFeaturedGame(catalogJSON, featuredGame, url);
       writeCompassTrace("fetch:modified=" + (!!modified) + " url=" + url);
@@ -1204,11 +1430,53 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
 
   const nativeXHROpen = XMLHttpRequest.prototype.open;
   const nativeXHRSend = XMLHttpRequest.prototype.send;
+  const nativeXHRAbort = XMLHttpRequest.prototype.abort;
 
-  XMLHttpRequest.prototype.open = function(method, url) {
+  function readCatalogResponse(xhr) {
+    return xhr.responseType === "json" ? xhr.response : nativeJSONParse(xhr.responseText);
+  }
+
+  function rewriteCompletedXHR() {
+    const xhr = this;
+    if (xhr.readyState !== 4 || xhr.status < 200 || xhr.status >= 300) return;
+    try {
+      const catalogJSON = readCatalogResponse(xhr);
+      if (xhr.__compassOriginalRequest) {
+        const featuredGame = extractFeaturedGame(catalogJSON);
+        if (featuredGame) {
+          featuredGameCache = featuredGame;
+          featuredGameCachedAt = now();
+          rewriteRememberedLobbies();
+          rewriteLiveLobbyState(featuredGame);
+        }
+      }
+      if (!xhr.__compassShouldRewrite) return;
+      const modified = injectFeaturedGame(catalogJSON, featuredGameCache, xhr.__compassRequestURL);
+      if (!modified) return;
+      const rewrittenText = JSON.stringify(modified);
+      if (!xhr.responseType || xhr.responseType === "text") {
+        Object.defineProperty(xhr, "responseText", { configurable: true, value: rewrittenText });
+      }
+      Object.defineProperty(xhr, "response", {
+        configurable: true,
+        value: xhr.responseType === "json" ? modified : rewrittenText
+      });
+    } catch (_) {}
+  }
+
+  XMLHttpRequest.prototype.open = function(method, url, async) {
+    this.__compassRequestGeneration = (this.__compassRequestGeneration || 0) + 1;
+    this.__compassAsync = async !== false;
     this.__compassShouldRewrite = shouldRewriteCatalog(url);
     this.__compassOriginalRequest = isOriginalCatalog(url);
     this.__compassRequestURL = url;
+    // Clear per-request overrides when the site reuses an XHR instance.
+    delete this.responseText;
+    delete this.response;
+    if (!this.__compassResponseListener) {
+      this.addEventListener("readystatechange", rewriteCompletedXHR, true);
+      this.__compassResponseListener = true;
+    }
     try {
       const u = new URL(url, location.href);
       if ((u.pathname || "").toLowerCase().includes("gamelist") &&
@@ -1216,61 +1484,31 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
         discoveredCatalogEndpoint = u.origin + u.pathname;
       }
     } catch (_) {}
-    writeCompassTrace("xhr.open url=" + url + " target=" + this.__compassShouldRewrite + " original=" + this.__compassOriginalRequest);
     return nativeXHROpen.apply(this, arguments);
   };
 
+  XMLHttpRequest.prototype.abort = function() {
+    this.__compassRequestGeneration = (this.__compassRequestGeneration || 0) + 1;
+    return nativeXHRAbort.apply(this, arguments);
+  };
+
   XMLHttpRequest.prototype.send = function(body) {
-    if (!this.__compassShouldRewrite && !this.__compassOriginalRequest) return nativeXHRSend.apply(this, arguments);
-
+    if (!this.__compassShouldRewrite) return nativeXHRSend.apply(this, arguments);
+    if (!this.__compassAsync) {
+      primeFeaturedGameSync(this.__compassRequestURL);
+      return nativeXHRSend.apply(this, arguments);
+    }
+    if (featuredGameCache && (now() - featuredGameCachedAt) < FEATURED_CACHE_WINDOW) {
+      return nativeXHRSend.apply(this, arguments);
+    }
     const xhr = this;
-    const previousReadyHandler = xhr.onreadystatechange;
-
-    xhr.onreadystatechange = function() {
-      const forwardReadyEvent = () => previousReadyHandler ? previousReadyHandler.apply(this, arguments) : undefined;
-      try {
-        if (xhr.__compassOriginalRequest && xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 300) {
-          try {
-            const sourceJSON = JSON.parse(xhr.responseText);
-            const featuredGame = extractFeaturedGame(sourceJSON);
-            writeCompassTrace("xhr.original found=" + (!!featuredGame) + " url=" + xhr.__compassRequestURL);
-            if (featuredGame) {
-              featuredGameCache = featuredGame;
-              featuredGameCachedAt = now();
-              rewriteRememberedLobbies();
-              rewriteLiveLobbyState(featuredGame);
-            }
-          } catch (_) {}
-        }
-
-        if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 300 && xhr.__compassShouldRewrite) {
-          let catalogJSON = null;
-          try {
-            catalogJSON = JSON.parse(xhr.responseText);
-          } catch (_) { return forwardReadyEvent(); }
-
-          (async function() {
-            const featuredGame = await fetchFeaturedGame(xhr.__compassRequestURL);
-            writeCompassTrace("xhr.target featuredAvailable=" + (!!featuredGame) + " url=" + xhr.__compassRequestURL);
-            const modified = injectFeaturedGame(catalogJSON, featuredGame, xhr.__compassRequestURL);
-            writeCompassTrace("xhr.target modified=" + (!!modified) + " url=" + xhr.__compassRequestURL);
-            if (!modified) return forwardReadyEvent();
-
-            const rewrittenText = JSON.stringify(modified);
-            try {
-              Object.defineProperty(xhr, "responseText", { value: rewrittenText });
-              Object.defineProperty(xhr, "response", { value: rewrittenText });
-            } catch (_) {}
-            return forwardReadyEvent();
-          })();
-          return;
-        }
-      } catch (_) {}
-
-      return forwardReadyEvent();
-    };
-
-    return nativeXHRSend.apply(this, arguments);
+    const generation = xhr.__compassRequestGeneration;
+    // Load the replacement before the catalog can fire any completion event.
+    // Then the capture listener patches data before onreadystatechange/load/loadend.
+    ensureFeaturedGame(xhr.__compassRequestURL).then(function() {
+      if (xhr.__compassRequestGeneration !== generation || xhr.readyState !== 1) return;
+      nativeXHRSend.call(xhr, body);
+    });
   };
 })();
 """
@@ -1279,41 +1517,60 @@ final class CompassWebController: UIViewController, WKNavigationDelegate, WKScri
 
 extension CompassWebController: WKUIDelegate {
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        configuration.userContentController.removeAllUserScripts()
-        configuration.userContentController.removeScriptMessageHandler(forName: "compassBridgeLog")
+        if let url = navigationAction.request.url,
+           Self.opensInExternalApp(url) {
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return nil
+        }
+
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         if let featuredDirective {
-            let script = WKUserScript(
-                source: CompassWebController.featuredGameInterceptor(rule: featuredDirective),
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false
-            )
-            configuration.userContentController.addUserScript(script)
+            if !configuration.userContentController.userScripts.contains(where: {
+                $0.source.contains("window.__giftCompassPlacementReady = true")
+            }) {
+                let script = WKUserScript(
+                    source: CompassWebController.featuredGameInterceptor(rule: featuredDirective, preloadedGameJSON: preloadedGameJSON),
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: false
+                )
+                configuration.userContentController.addUserScript(script)
+            }
+            configuration.userContentController.removeScriptMessageHandler(forName: "compassBridgeLog")
             configuration.userContentController.add(self, name: "compassBridgeLog")
         }
 
-        let createdPopup = WKWebView(frame: .zero, configuration: configuration)
-        createdPopup.navigationDelegate = self
-        createdPopup.uiDelegate = self
-        createdPopup.customUserAgent = webView.customUserAgent
-        createdPopup.translatesAutoresizingMaskIntoConstraints = false
+        let popupURL = navigationAction.request.url
+        print("Compass popup requested:", popupURL?.host ?? "local", popupURL?.path ?? "about:blank")
+        return installPopup(configuration: configuration, source: webView)
+    }
 
-        secondaryWebView?.removeFromSuperview()
-        secondaryWebView = createdPopup
+    private func installPopup(configuration: WKWebViewConfiguration, source: WKWebView) -> WKWebView {
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
 
-        view.addSubview(createdPopup)
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        popup.navigationDelegate = self
+        popup.uiDelegate = self
+        popup.customUserAgent = source.customUserAgent
+        popup.allowsBackForwardNavigationGestures = true
+        popup.translatesAutoresizingMaskIntoConstraints = false
+
+        // Keep the opener alive for redirects, POST forms and window.opener callbacks.
+        popupWebViews.append(popup)
+
+        view.addSubview(popup)
         NSLayoutConstraint.activate([
-            createdPopup.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            createdPopup.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            createdPopup.topAnchor.constraint(equalTo: view.topAnchor),
-            createdPopup.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            popup.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            popup.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            popup.topAnchor.constraint(equalTo: view.topAnchor),
+            popup.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-        return createdPopup
+        return popup
     }
     
     func webViewDidClose(_ webView: WKWebView) {
         webView.removeFromSuperview()
-        if secondaryWebView === webView {
-            secondaryWebView = nil
-        }
+        popupWebViews.removeAll { $0 === webView }
     }
 }

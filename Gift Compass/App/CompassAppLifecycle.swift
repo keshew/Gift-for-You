@@ -23,20 +23,28 @@ enum CompassSessionCache {
     static let pushIDKey = "compass.bridge.pendingPushID"
     static let pendingPushKey = "compass.bridge.pushPending"
     static let adjustAttributionKey = "compass.bridge.adjustAttribution"
-    private static let clientIDKey = "compass.bridge.clientID"
+    private static let clientIDKey = "compass.bridge.serverClientID"
+    private static let legacyGeneratedClientIDKey = "compass.bridge.clientID"
 
     static var clientUUID: String {
         ClientIdentity.current
     }
 
-    static var clientID: String {
+    static var clientID: String? {
         if let saved = UserDefaults.standard.string(forKey: clientIDKey),
            UUID(uuidString: saved) != nil {
             return saved
         }
-        let generated = UUID().uuidString.lowercased()
-        UserDefaults.standard.set(generated, forKey: clientIDKey)
-        return generated
+        return nil
+    }
+
+    static func prepareServerClientIdentity() {
+        UserDefaults.standard.removeObject(forKey: legacyGeneratedClientIDKey)
+    }
+
+    static func storeServerClientID(_ rawValue: String?) {
+        guard let value = nonEmpty(rawValue), UUID(uuidString: value) != nil else { return }
+        UserDefaults.standard.set(value, forKey: clientIDKey)
     }
 
     static var firebaseToken: String? {
@@ -96,7 +104,7 @@ final class GiftCompassAppDelegate: NSObject, UIApplicationDelegate, UNUserNotif
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         _ = CompassSessionCache.clientUUID
-        _ = CompassSessionCache.clientID
+        CompassSessionCache.prepareServerClientIdentity()
         startMessagingPipeline()
         startAttributionPipeline()
 
